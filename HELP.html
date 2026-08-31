@@ -1,0 +1,191 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>noteXnote Help</title>
+<style>
+  body {
+    background: #1a1a2e;
+    color: #e0e0e8;
+    font-family: -apple-system, "Helvetica Neue", Helvetica, sans-serif;
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 32px 24px 64px;
+    line-height: 1.55;
+  }
+  h1 {
+    font-size: 28px;
+    margin-bottom: 4px;
+  }
+  .tagline {
+    color: #8888aa;
+    margin-top: 0;
+    margin-bottom: 32px;
+    font-size: 15px;
+  }
+  h2 {
+    color: #ff6b35;
+    font-size: 18px;
+    border-bottom: 1px solid #2a2a3e;
+    padding-bottom: 6px;
+    margin-top: 36px;
+  }
+  h3 {
+    color: #4dd0e1;
+    font-size: 15px;
+    margin-bottom: 4px;
+  }
+  code, kbd {
+    background: #2a2a3e;
+    color: #ffcc66;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-family: Menlo, monospace;
+    font-size: 13px;
+  }
+  .box {
+    background: #22223a;
+    border-left: 3px solid #ff6b35;
+    padding: 10px 16px;
+    border-radius: 4px;
+    margin: 12px 0;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 8px 0 20px;
+  }
+  td, th {
+    text-align: left;
+    padding: 6px 10px;
+    border-bottom: 1px solid #2a2a3e;
+    font-size: 14px;
+  }
+  th { color: #8888aa; font-weight: 600; }
+  ul { padding-left: 20px; }
+  li { margin-bottom: 4px; }
+  a { color: #4dd0e1; }
+  .footer {
+    margin-top: 48px;
+    color: #666680;
+    font-size: 12px;
+    border-top: 1px solid #2a2a3e;
+    padding-top: 16px;
+  }
+</style>
+</head>
+<body>
+
+<h1>noteXnote</h1>
+<p class="tagline">Slow it down. Loop it. Learn it.</p>
+
+<div class="box">
+Quick start: open a song from the <b>Source</b> panel, hit <kbd>Space</kbd>
+to play, and drag the <b>Speed</b> slider down to slow it to whatever
+tempo you want to play along with, keeping the original pitch if
+<b>Pitch Lock</b> is on.
+</div>
+
+<h2>Loading a song</h2>
+<p>
+The <b>Source</b> panel supports a local audio file, a pasted URL
+(YouTube, SoundCloud, Bandcamp, and 1000+ sites via <code>yt-dlp</code>),
+or a Spotify link (via <code>spotdl</code>). The folder-shortcut button
+(📁) next to Open jumps straight to any music folders noteXnote finds on
+your Mac.
+</p>
+
+<h2>Speed &amp; Pitch Lock</h2>
+<p>
+Drag the Speed slider (or type an exact value into its number field) to
+slow a song down to anywhere from 25% to 200% of its original tempo.
+With <b>Pitch Lock</b> on, the pitch stays put — a slowed-down riff still
+sounds like the same riff, not a chipmunk. Under the hood this is WSOLA
+time-stretching with normalized-correlation splice matching, tuned to
+avoid the phasey "echo" artifact that cheaper time-stretchers produce on
+reverb-heavy recordings.
+</p>
+
+<h2>D/A Reconstruction Filter</h2>
+<p>
+Every song, automatically: noteXnote runs a simulated analog reconstruction
+filter, the same kind of stage a real DAC uses to turn digital samples back
+into a smooth waveform. It's a gentle rolloff above 15kHz that softens the
+harsh digital edge some recordings carry — no button, no setting, it's just
+how noteXnote sounds.
+</p>
+
+<h2>Reference Mode</h2>
+<p>
+One click on <b>🎯 Play at 1× (Reference)</b> jumps back to the original,
+unprocessed recording at full speed — useful for re-anchoring your ear to
+how the part is actually supposed to sound — then jump right back into
+practice speed.
+</p>
+
+<h2>A-B Loop &amp; Loop Library</h2>
+<p>
+Set <b>A</b> and <b>B</b> points anywhere in the song to loop just that
+section on repeat. The <b>Loop Library</b> holds up to 5 named loops per
+song — save the intro, the tricky bridge run, the solo — and jump between
+them with one click. Everything is remembered per-song, so it's all still
+there next time you open the same file.
+</p>
+
+<h2>Zoom view</h2>
+<p>
+Below the main waveform, the <b>Zoom</b> panel is a DAW-style detail view
+that scrolls under a fixed center playhead as you play, with a
+millisecond-precision time ruler. Click or drag inside it to seek with
+much finer granularity than the overview waveform allows.
+</p>
+
+<h2>EQ — Boost</h2>
+<p>
+Four one-click presets — <b>Flat</b>, <b>Bass</b>, <b>Mid</b>,
+<b>Treble</b> — give a gentle, headroom-safe tonal boost tuned so you'll
+never hit clipping, no matter how hot the source mix is.
+</p>
+
+<h2>Transport &amp; keyboard shortcuts</h2>
+<table>
+  <tr><th>Key</th><th>Action</th></tr>
+  <tr><td><kbd>Space</kbd></td><td>Play / Pause</td></tr>
+  <tr><td><kbd>←</kbd></td><td>Rewind a few seconds</td></tr>
+  <tr><td><kbd>→</kbd></td><td>Fast-forward a few seconds</td></tr>
+  <tr><td><kbd>⌘O</kbd></td><td>Open a file</td></tr>
+</table>
+<p>
+The transport row's ⏮ / ⏭ buttons jump to the start/end of the current
+A-B loop when one is set, otherwise to the start/end of the song.
+</p>
+
+<h2>Plugins</h2>
+<p>
+Plugins are how noteXnote grows without the core app ever changing shape.
+A plugin becomes &ldquo;official&rdquo; via GitHub: a pull request to
+the <a href="https://github.com/PatchyFogg/noteXnote">noteXnote repo</a>, a
+real review, and a proper release. This helps to maintain application
+integrity and choice for users.
+</p>
+<p>
+Got a released plugin you want to try? Drop its <code>.py</code> file into
+your plugins folder (<b>Plugins → Open Plugins Folder…</b>) and noteXnote
+picks it up on its own — no setup, no fuss. <b>Plugins → Manage Plugins…</b>
+lists everything installed with a quick description and a one-click
+enable/disable toggle, so you always know exactly what's running and can
+flip it off just as easily.
+</p>
+
+<h2>Uninstalling</h2>
+<p>
+Use <b>Help → Uninstall noteXnote…</b> to remove the app and all of its
+saved data (preferences, loops, EQ choices, audio cache) in one step.
+</p>
+
+<div class="footer">
+noteXnote — <a href="https://github.com/PatchyFogg/noteXnote">github.com/PatchyFogg/noteXnote</a>
+</div>
+
+</body>
+</html>
