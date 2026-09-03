@@ -5,10 +5,7 @@ DATA_FILES = ['HELP.html', 'progress.gif']
 OPTIONS = {
     'argv_emulation': False,
     'iconfile': 'noteXnote.icns',
-    'packages': ['numpy', 'sounddevice', 'librosa', 'scipy',
-                 'sklearn', 'soundfile', 'audioread', 'pooch',
-                 'lazy_loader', 'soxr', 'msgpack', 'joblib',
-                 'decorator', 'numba', '_soundfile_data'],
+    'packages': ['numpy', 'sounddevice', 'scipy'],
     'includes': ['sqlite3', '_sounddevice_data'],
     'frameworks': [],
     'plist': {

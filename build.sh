@@ -70,20 +70,6 @@ if [ -f "$PA_SRC" ]; then
     cp "$PA_SRC" "$BUNDLE/Contents/Resources/_sounddevice_data/portaudio-binaries/"
 fi
 
-# Bundle libsndfile where soundfile (a librosa dependency, kept bundled
-# for any future analysis plugin) expects it. py2app's 'includes' only
-# pulls in _soundfile_data's __init__.py, not the .dylib sitting next to
-# it, so it has to be copied by hand — same story as PortAudio above.
-SF_SRC=".venv/lib/python3.13/site-packages/_soundfile_data/libsndfile_x86_64.dylib"
-if [ -f "$SF_SRC" ]; then
-    SF_DEST="$BUNDLE/Contents/Resources/lib/python3.13/_soundfile_data"
-    mkdir -p "$SF_DEST"
-    cp "$SF_SRC" "$SF_DEST/"
-    chmod 755 "$SF_DEST/libsndfile_x86_64.dylib"
-else
-    echo "  WARNING: libsndfile.dylib not found at $SF_SRC"
-fi
-
 # Rewrite every @rpath reference
 echo "Relinking binaries..."
 for binary in $(find "$BUNDLE/Contents/Resources" "$FW" \( -name '*.so' -o -name '*.dylib' \) 2>/dev/null); do
