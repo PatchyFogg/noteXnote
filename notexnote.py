@@ -36,9 +36,39 @@ EQ_PRESETS = {
 
 NORM_TARGET_DB = -6.0
 DA_FILTER_CUTOFF_HZ = 15000.0
+PITCH_MIN_ST = -12
+PITCH_MAX_ST = 12
 
 _BREW_PATHS = ['/usr/local/bin', '/opt/homebrew/bin',
                os.path.expanduser('~/bin'), '/usr/bin']
+
+_EXTERNAL_ENV_STRIP = (
+    'DYLD_LIBRARY_PATH', 'DYLD_FALLBACK_LIBRARY_PATH',
+    'DYLD_FRAMEWORK_PATH', 'DYLD_FALLBACK_FRAMEWORK_PATH',
+    'DYLD_INSERT_LIBRARIES', 'PYTHONHOME', 'PYTHONPATH', 'RESOURCEPATH',
+)
+
+
+def _external_env():
+    """Environment for an independently-linked external tool (yt-dlp,
+    ffmpeg, spotdl) — a copy of ours with our own bundled Python's
+    library-resolution overrides stripped out.
+
+    The packaged app sets DYLD_LIBRARY_PATH/PYTHONHOME (etc.) so its own
+    bundled Python and extension modules resolve dylibs from inside
+    Contents/Frameworks — including a bundled libssl/libcrypto pulled in
+    by the numpy/scipy stack. An external tool has its own, separately
+    linked dylibs; if it inherits these overrides, its dynamic linker can
+    get pointed at the app's copies instead of its own, and for OpenSSL
+    that means loading an ABI-incompatible libssl/libcrypto — a real,
+    deterministic SIGSEGV inside OpenSSL's provider code (confirmed via
+    a crash whose captured stderr was a faulthandler dump, not a normal
+    yt-dlp error), not a rare timing race. External tools must get a
+    clean environment so their own linker resolves their own dylibs."""
+    env = os.environ.copy()
+    for key in _EXTERNAL_ENV_STRIP:
+        env.pop(key, None)
+    return env
 
 
 def _find_tool(name):
@@ -51,6 +81,48 @@ def _find_tool(name):
         if os.path.isfile(p) and os.access(p, os.X_OK):
             return p
     return None
+
+
+def _extract_ytdlp_error(stderr):
+    """yt-dlp's stderr is often several lines of diagnostic noise before
+    the actual reason — pull out the real ERROR: line instead of dumping
+    all of it (or worse, none of it) at the user."""
+    if not stderr:
+        return "unknown error"
+    lines = [l.strip() for l in stderr.splitlines() if l.strip()]
+    for l in lines:
+        if l.startswith('ERROR:'):
+            return l[len('ERROR:'):].strip()
+    return lines[-1] if lines else "unknown error"
+
+
+def _youtube_search(query, n=8):
+    """Search YouTube via yt-dlp with no download — flat-playlist mode
+    skips per-video metadata fetch, so this is fast. Returns a list of
+    {'title', 'duration', 'channel', 'url'} dicts. Raises on failure with
+    yt-dlp's actual error message, not just "exit status 1"."""
+    ytdlp = _find_tool('yt-dlp')
+    if not ytdlp:
+        raise RuntimeError("yt-dlp not found. Install with: brew install yt-dlp")
+    try:
+        result = subprocess.run(
+            [ytdlp, f'ytsearch{n}:{query}', '--flat-playlist', '-J', '--no-warnings'],
+            check=True, capture_output=True, text=True, timeout=30,
+            env=_external_env())
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(_extract_ytdlp_error(e.stderr)) from None
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("search timed out after 30s") from None
+    data = json.loads(result.stdout)
+    out = []
+    for e in data.get('entries') or []:
+        out.append({
+            'title': e.get('title') or 'Untitled',
+            'duration': e.get('duration'),
+            'channel': e.get('channel') or e.get('uploader') or '',
+            'url': e.get('url') or e.get('webpage_url') or '',
+        })
+    return out
 
 
 WAVE_BG = '#1a1a2e'
@@ -183,9 +255,6 @@ def _fmt_time_lcd(seconds):
 
 # ─── Song Database ───────────────────────────────────────────────────
 
-LOOP_SLOT_COUNT = 5
-
-
 class SongDB:
     def __init__(self):
         self._conn = sqlite3.connect(
@@ -197,62 +266,42 @@ class SongDB:
             pitch_lock INTEGER DEFAULT 1,
             loop_a REAL, loop_b REAL,
             position REAL DEFAULT 0,
-            eq_preset TEXT
+            eq_preset TEXT,
+            pitch_semitones INTEGER DEFAULT 0
         )''')
         try:
             self._conn.execute('ALTER TABLE songs ADD COLUMN eq_preset TEXT')
         except sqlite3.OperationalError:
             pass  # already exists (pre-existing DB from before this column)
-        self._conn.execute('''CREATE TABLE IF NOT EXISTS loop_slots (
-            path TEXT,
-            slot INTEGER,
-            name TEXT,
-            loop_a REAL,
-            loop_b REAL,
-            PRIMARY KEY (path, slot)
-        )''')
+        try:
+            self._conn.execute(
+                'ALTER TABLE songs ADD COLUMN pitch_semitones INTEGER DEFAULT 0')
+        except sqlite3.OperationalError:
+            pass  # already exists (pre-existing DB from before this column)
         self._conn.commit()
 
     def load(self, path):
         row = self._conn.execute(
-            'SELECT speed, pitch_lock, loop_a, loop_b, position, eq_preset FROM songs WHERE path=?',
+            'SELECT speed, pitch_lock, loop_a, loop_b, position, eq_preset, '
+            'pitch_semitones FROM songs WHERE path=?',
             (path,)).fetchone()
         if row:
             return {'speed': row[0], 'pitch_lock': bool(row[1]),
                     'loop_a': row[2], 'loop_b': row[3], 'position': row[4],
-                    'eq_preset': row[5]}
+                    'eq_preset': row[5], 'pitch_semitones': row[6] or 0}
         return None
 
-    def save(self, path, speed, pitch_lock, loop_a, loop_b, position, eq_preset=None):
-        self._conn.execute('''INSERT INTO songs (path, speed, pitch_lock, loop_a, loop_b, position, eq_preset)
-            VALUES (?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET
+    def save(self, path, speed, pitch_lock, loop_a, loop_b, position,
+              eq_preset=None, pitch_semitones=0):
+        self._conn.execute('''INSERT INTO songs (path, speed, pitch_lock, loop_a, loop_b,
+            position, eq_preset, pitch_semitones)
+            VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET
             speed=excluded.speed, pitch_lock=excluded.pitch_lock,
             loop_a=excluded.loop_a, loop_b=excluded.loop_b,
-            position=excluded.position, eq_preset=excluded.eq_preset''',
-            (path, speed, int(pitch_lock), loop_a, loop_b, position, eq_preset))
-        self._conn.commit()
-
-    def load_slots(self, path):
-        rows = self._conn.execute(
-            'SELECT slot, name, loop_a, loop_b FROM loop_slots WHERE path=? ORDER BY slot',
-            (path,)).fetchall()
-        slots = [{'name': '', 'loop_a': None, 'loop_b': None}
-                 for _ in range(LOOP_SLOT_COUNT)]
-        for slot, name, la, lb in rows:
-            if 0 <= slot < LOOP_SLOT_COUNT:
-                slots[slot] = {'name': name or '', 'loop_a': la, 'loop_b': lb}
-        return slots
-
-    def save_slot(self, path, slot, name, loop_a, loop_b):
-        self._conn.execute('''INSERT INTO loop_slots (path, slot, name, loop_a, loop_b)
-            VALUES (?,?,?,?,?) ON CONFLICT(path, slot) DO UPDATE SET
-            name=excluded.name, loop_a=excluded.loop_a, loop_b=excluded.loop_b''',
-            (path, slot, name, loop_a, loop_b))
-        self._conn.commit()
-
-    def clear_slot(self, path, slot):
-        self._conn.execute('DELETE FROM loop_slots WHERE path=? AND slot=?',
-                            (path, slot))
+            position=excluded.position, eq_preset=excluded.eq_preset,
+            pitch_semitones=excluded.pitch_semitones''',
+            (path, speed, int(pitch_lock), loop_a, loop_b, position, eq_preset,
+             pitch_semitones))
         self._conn.commit()
 
 
@@ -296,7 +345,7 @@ def load_audio(path, sr=DEFAULT_SR):
     cmd = [ffmpeg, '-y', '-i', path,
            '-ar', str(sr), '-ac', '1', '-sample_fmt', 's16',
            '-loglevel', 'error', temp_wav]
-    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    subprocess.run(cmd, check=True, capture_output=True, text=True, env=_external_env())
     with wave.open(temp_wav, 'r') as wf:
         raw = wf.readframes(wf.getnframes())
     audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
@@ -462,6 +511,10 @@ def resample_stretch(audio, speed):
     ).astype(np.float32)
 
 
+def _semitone_ratio(semitones):
+    return 2.0 ** (semitones / 12.0)
+
+
 def _apply_eq_fft(audio, sr, bands, da_filter=False):
     n = len(audio)
     has_bands = any(abs(db) >= 0.1 for _, db in bands)
@@ -545,6 +598,7 @@ class AudioEngine:
         self.ref_position = 0
         self.speed = 1.0
         self.pitch_lock = True
+        self.pitch_semitones = 0
         self.volume = 0.5
         self.playing = False
         self.position = 0
@@ -576,17 +630,48 @@ class AudioEngine:
         self.stretched = None
         self.processed = None
 
-    def process(self, speed=None, pitch_lock=None):
+    def unload(self):
+        self.stop()
+        self.original = None
+        self.stretched = None
+        self.processed = None
+        self.file_path = None
+        self.loop_a = None
+        self.loop_b = None
+        self.position = 0
+        self.ref_position = 0
+        self.reference_mode = False
+
+    def process(self, speed=None, pitch_lock=None, pitch_semitones=None):
         if speed is not None:
             self.speed = speed
         if pitch_lock is not None:
             self.pitch_lock = pitch_lock
+        if pitch_semitones is not None:
+            self.pitch_semitones = pitch_semitones
         if self.original is None:
             return
+        pr = _semitone_ratio(self.pitch_semitones)
+        no_shift = abs(pr - 1.0) < 1e-6
+        # Transpose is layered on top of the existing speed/pitch_lock
+        # behavior via one resample pass (sets pitch) + one WSOLA pass
+        # (restores whatever duration the speed setting already dictates)
+        # — the same resample-then-WSOLA-restore trick used for pitch_lock
+        # itself, just with the ratios solved so the no-transpose case
+        # (pitch_semitones == 0) reduces exactly to the original single-call
+        # behavior below, unchanged.
         if self.pitch_lock:
-            self.stretched = wsola_stretch(self.original, self.speed, self.sr)
+            if no_shift:
+                self.stretched = wsola_stretch(self.original, self.speed, self.sr)
+            else:
+                shifted = resample_stretch(self.original, pr)
+                self.stretched = wsola_stretch(shifted, self.speed / pr, self.sr)
         else:
-            self.stretched = resample_stretch(self.original, self.speed)
+            if no_shift:
+                self.stretched = resample_stretch(self.original, self.speed)
+            else:
+                shifted = resample_stretch(self.original, self.speed * pr)
+                self.stretched = wsola_stretch(shifted, 1.0 / pr, self.sr)
         self._finalize()
 
     def _finalize(self):
@@ -1207,12 +1292,32 @@ class WaveformView(tk.Canvas):
         self._peaks = None
         self._rms = None
         self._head_id = None
+        self._busy = False
         self.segments = []  # list of {'start','end','tag','name'}
         self.on_segment_click = None  # callback(segment_dict)
-        self.on_seek = None  # callback() fired after a click/drag seek
+        self.on_seek = None  # callback() fired after a click/drag/wheel seek
         self.bind('<Configure>', lambda e: self._draw())
         self.bind('<Button-1>', self._click)
         self.bind('<B1-Motion>', self._drag)
+        self.bind('<MouseWheel>', self._wheel)
+
+    def set_busy(self, busy):
+        """Blank the drawn waveform while the busy spinner is overlaid on
+        top of us. The spinner Label is an opaque widget, not a real
+        transparent overlay, so whenever it sits on top of an already-drawn
+        waveform it cuts a flat-colored rectangle out of the drawing —
+        visible as a "frame"/border around the spinner. Blanking first
+        recreates the one case that already looks right (a fresh launch,
+        nothing drawn yet), instead of trying to pixel-match a Label's bg
+        against whatever the waveform happens to be drawing underneath it."""
+        self._busy = busy
+        self._draw()
+
+    def clear(self):
+        self._peaks = None
+        self._rms = None
+        self.segments = []
+        self._draw()
 
     def set_audio(self, audio):
         n = max(self.winfo_width(), 400)
@@ -1233,6 +1338,8 @@ class WaveformView(tk.Canvas):
         h = self.winfo_height()
         if w < 10 or h < 10:
             return
+        if self._busy:
+            return  # blank canvas — see set_busy()
         # Reserve top strip for segments if any
         strip_h = SEGMENT_STRIP_H if self.segments else 0
         wave_top = strip_h
@@ -1342,6 +1449,14 @@ class WaveformView(tk.Canvas):
         if self.on_seek:
             self.on_seek()
 
+    def _wheel(self, event):
+        if not self.engine.loaded:
+            return
+        self.engine.seek_relative(1.0 if event.delta > 0 else -1.0)
+        self.update_head()
+        if self.on_seek:
+            self.on_seek()
+
 
 class ZoomedWaveformView(tk.Canvas):
     """DAW-style detail view: a fixed time window centered on the playhead,
@@ -1355,10 +1470,11 @@ class ZoomedWaveformView(tk.Canvas):
         self.window_seconds = window_seconds
         self._win_start = 0.0   # seconds — left edge of the visible window
         self._win_span = window_seconds
-        self.on_seek = None  # callback() fired after a click/drag seek
+        self.on_seek = None  # callback() fired after a click/drag/wheel seek
         self.bind('<Configure>', lambda e: self.refresh())
         self.bind('<Button-1>', self._click)
         self.bind('<B1-Motion>', self._drag)
+        self.bind('<MouseWheel>', self._wheel)
 
     def _buf(self):
         if self.engine.reference_mode:
@@ -1491,6 +1607,14 @@ class ZoomedWaveformView(tk.Canvas):
     def _drag(self, event):
         self._click(event)
 
+    def _wheel(self, event):
+        if not self.engine.loaded:
+            return
+        self.engine.seek_relative(0.25 if event.delta > 0 else -0.25)
+        self.refresh()
+        if self.on_seek:
+            self.on_seek()
+
 
 # ─── Main Application ───────────────────────────────────────────────
 
@@ -1504,6 +1628,8 @@ class NoteXNoteApp:
         self.db = SongDB()
         self._busy = False
         self._speed_pending = None
+        self._pitch_pending = None
+        self._reprocess_after = None
         self._update_id = None
         self._load_prefs()
         self._build_ui()
@@ -1553,6 +1679,20 @@ class NoteXNoteApp:
 
     def _build_ui(self):
         self._build_menubar()
+        # Buttons never take keyboard focus. Tk gives any focused button
+        # its own default binding where <space>/<Return> re-invokes that
+        # button's command — separate from and in addition to any of our
+        # own key bindings elsewhere. With as many buttons as this app has
+        # (Transport, EQ, Speed/Pitch presets, search...), a click leaves
+        # some button focused, and the next unrelated keypress can
+        # silently re-trigger it (confirmed: a Pitch +/- click followed by
+        # any Space press re-applied the same step, making one semitone
+        # sound like a whole step). This is the actual fix, not removing
+        # individual key bindings one at a time as each button's focus
+        # happens to surface the problem again.
+        style = ttk.Style()
+        style.configure('TButton', takefocus=0)
+        style.configure('TCheckbutton', takefocus=0)
         main = ttk.Frame(self.root)
         main.pack(fill='both', expand=True, padx=8, pady=8)
         paned = ttk.PanedWindow(main, orient='horizontal')
@@ -1583,6 +1723,8 @@ class NoteXNoteApp:
             self.file_frame, text="\U0001f4c1 ▾", width=4,
             command=self._open_shortcut_menu)
         self.folders_btn.pack(side='right', padx=(4, 0))
+        ttk.Button(self.file_frame, text="⏏", width=3,
+                   command=self._eject_source).pack(side='right', padx=(4, 0))
         self.url_frame = ttk.Frame(src)
         self.url_var = tk.StringVar()
         url_row = ttk.Frame(self.url_frame)
@@ -1597,6 +1739,55 @@ class NoteXNoteApp:
         self.url_hint.pack(anchor='w', pady=(2, 0))
         self._src_changed()
 
+        # YouTube Search — sits directly under Source, above the waveform:
+        # a natural transition from "here's what's loaded" to "here's
+        # where you go find something new." Core behavior is audio-only
+        # (search, click, load audio into the practice engine, exactly
+        # like Paste URL). A plugin can register a video renderer via
+        # set_youtube_renderer() to additionally draw live video into
+        # yt_video_container; without one, that container just stays
+        # empty and unused.
+        yt = ttk.LabelFrame(left, text="YouTube Search", padding=5)
+        yt.pack(fill='x', pady=(8, 0), padx=(0, 4))
+        yt_row = ttk.Frame(yt)
+        yt_row.pack(fill='x')
+        self.yt_query_var = tk.StringVar()
+        yt_entry = ttk.Entry(yt_row, textvariable=self.yt_query_var)
+        yt_entry.pack(side='left', fill='x', expand=True)
+        yt_entry.bind('<Return>', lambda e: self._yt_search())
+        self.yt_search_btn = ttk.Button(yt_row, text="Search", width=7,
+                                         command=self._yt_search)
+        self.yt_search_btn.pack(side='left', padx=(4, 0))
+        ttk.Button(yt_row, text="⏏", width=2,
+                   command=self._eject_source).pack(side='left', padx=(2, 0))
+        self._yt_search_busy = False
+        self._yt_search_token = 0
+
+        yt_list_row = ttk.Frame(yt)
+        yt_list_row.pack(fill='x', pady=(4, 0))
+        yt_scroll = ttk.Scrollbar(yt_list_row, orient='vertical')
+        self.yt_listbox = tk.Listbox(
+            yt_list_row, height=6, bg='#22223a', fg='#e0e0e8',
+            selectbackground='#4dd0e1', selectforeground='#111',
+            highlightthickness=0, bd=0, font=('Helvetica', 10),
+            yscrollcommand=yt_scroll.set)
+        yt_scroll.config(command=self.yt_listbox.yview)
+        self.yt_listbox.pack(side='left', fill='both', expand=True)
+        yt_scroll.pack(side='right', fill='y')
+        self.yt_listbox.bind('<Double-Button-1>', lambda e: self._yt_load_selected())
+        self.yt_listbox.bind('<Return>', lambda e: self._yt_load_selected())
+
+        self.yt_status_lbl = ttk.Label(yt, text="", foreground='#888',
+                                        font=('Helvetica', 9))
+        self.yt_status_lbl.pack(anchor='w', pady=(2, 0))
+
+        # Reserved for a video-renderer plugin — empty otherwise
+        self.yt_video_container = ttk.Frame(yt)
+        self.yt_video_container.pack(fill='x', pady=(4, 0))
+
+        self._yt_results = []
+        self._youtube_video_renderer = None
+
         # Overview waveform (same size as before, now underneath Source)
         wf_container = ttk.Frame(left)
         wf_container.pack(fill='x', expand=False, padx=(0, 4))
@@ -1604,11 +1795,14 @@ class NoteXNoteApp:
         self.waveform.on_segment_click = self._on_segment_click
         self.waveform.on_seek = self._on_scrub
         self.waveform.pack(fill='both', expand=True)
-        # Busy overlay, centered over the waveform — a bouncing blue neon
-        # equalizer GIF (16 frames, native 200x200), matching the reference
-        # icon sheet's audio-bars style.
+        # Busy overlay, centered over the waveform — the shared cooliosis
+        # spinner (61 frames, native 200x200, flattened onto WAVE_BG),
+        # standardized across the user's apps in Python-Projects/cc/cooliosis.
+        # scale=2 (100x100) — at scale=1 the spinner's own bounding box
+        # (200px) was taller than the whole waveform view (height=180),
+        # overwhelming it well beyond just the visible spinner glyph.
         self._spinner = ProgressIndicator(
-            self.waveform, _resource_path('progress.gif'), fps=16, scale=1)
+            self.waveform, _resource_path('progress.gif'), fps=16, scale=2)
         self._spin_lbl = tk.Label(self.waveform, text="", bg=WAVE_BG,
                                    fg='#ccc', font=('Helvetica', 11, 'bold'))
         time_bar = ttk.LabelFrame(left, text="Time", padding=6)
@@ -1678,6 +1872,24 @@ class NoteXNoteApp:
                          variable=self.pl_var,
                          command=self._pitch_lock_toggle).pack(anchor='w', pady=(4, 0))
 
+        # Pitch — semitone transpose, independent of Speed. Works whether
+        # or not Pitch Lock is on: it shifts pitch relative to whatever
+        # Speed/Pitch Lock already produce, rather than replacing them.
+        pit = ttk.LabelFrame(right, text="Pitch", padding=5)
+        pit.pack(fill='x', pady=(0, 4))
+        pit_row = ttk.Frame(pit)
+        pit_row.pack()
+        ttk.Button(pit_row, text="−", width=3,
+                   command=lambda: self._pitch_step(-1)).pack(side='left')
+        self.pitch_var = tk.StringVar(value="0 st")
+        ttk.Label(pit_row, textvariable=self.pitch_var, width=7,
+                  anchor='center', font=('Menlo', 14, 'bold')).pack(side='left', padx=4)
+        ttk.Button(pit_row, text="+", width=3,
+                   command=lambda: self._pitch_step(1)).pack(side='left')
+        ttk.Button(pit_row, text="Reset", width=6,
+                   command=lambda: self._pitch_step(0, absolute=True)).pack(
+                       side='left', padx=(8, 0))
+
         # Master Volume
         vol = ttk.LabelFrame(right, text="Master Volume", padding=5)
         vol.pack(fill='x', pady=(0, 4))
@@ -1720,7 +1932,7 @@ class NoteXNoteApp:
                                   relief='raised', bd=2,
                                   command=self._toggle_reference,
                                   activebackground='#ffb347',
-                                  highlightthickness=0)
+                                  highlightthickness=0, takefocus=0)
         self.ref_btn.pack(fill='x', ipady=1)
         self._ref_default_bg = self.ref_btn.cget('bg')
 
@@ -1729,14 +1941,11 @@ class NoteXNoteApp:
         lp.pack(fill='x', pady=(0, 4))
         lb = ttk.Frame(lp)
         lb.pack()
-        ttk.Button(lb, text="Set A", width=6, command=self._set_a).pack(side='left', padx=4)
-        ttk.Button(lb, text="Set B", width=6, command=self._set_b).pack(side='left', padx=4)
-        ttk.Button(lb, text="Clear", width=6, command=self._clr_loop).pack(side='left', padx=4)
+        ttk.Button(lb, text="Set Start", width=8, command=self._set_a).pack(side='left', padx=4)
+        ttk.Button(lb, text="Set End", width=8, command=self._set_b).pack(side='left', padx=4)
+        ttk.Button(lb, text="Clear", width=8, command=self._clr_loop).pack(side='left', padx=4)
         self.loop_lbl = ttk.Label(lp, text="No loop set")
         self.loop_lbl.pack(pady=(2, 0))
-
-        # Loop Library
-        self._build_loop_slots(right)
 
         # EQ
         eq = ttk.LabelFrame(right, text="EQ — Boost", padding=5)
@@ -1749,14 +1958,18 @@ class NoteXNoteApp:
             b = tk.Button(eq_row, text=name, width=7,
                           font=('Helvetica', 11, 'bold'),
                           relief='raised', bd=2,
-                          highlightthickness=0,
+                          highlightthickness=0, takefocus=0,
                           command=lambda k=name: self._eq_preset(k))
             b.pack(side='left', padx=2, expand=True, fill='x', ipady=2)
             self._eq_btns[name] = b
         self._eq_highlight()
 
-        # Keys
-        self.root.bind('<space>', lambda e: self._toggle_play())
+        # Keys — no Space binding: a focused ttk.Button/Checkbutton has
+        # its own default Space-activates-me binding, so Space double-fired
+        # (once for the button that last had focus, once for playback)
+        # whenever any button anywhere had keyboard focus, which given how
+        # many buttons this app has was most of the time. Not worth
+        # fighting Tk's focus/binding model for — removed rather than fixed.
         self.root.bind('<Left>', lambda e: self._rw())
         self.root.bind('<Right>', lambda e: self._ff())
         self.root.bind('<Command-o>', lambda e: self._open_file())
@@ -1820,23 +2033,44 @@ class NoteXNoteApp:
         url = self.url_var.get().strip()
         if not url:
             return
+        self._download_and_load(url)
+
+    def _download_and_load(self, url, busy_text="Downloading audio...", _retried=False):
+        """Download a URL's audio via yt-dlp and load it — shared by the
+        Paste URL source and YouTube search results. yt-dlp needs frequent
+        updates to keep up with YouTube's own changes; a stale copy fails
+        with cryptic errors ("The page needs to be reloaded", etc.) that
+        mean nothing to a user. On failure, offer to self-update yt-dlp
+        (its own -U flag, so this works regardless of how it was
+        installed — Homebrew, pip, or a standalone binary) and retry once
+        automatically rather than just surfacing a raw traceback."""
         ytdlp = _find_tool('yt-dlp')
         if not ytdlp:
             messagebox.showerror("Missing yt-dlp",
                                  "Install with: brew install yt-dlp")
             return
-        self._show_busy("Downloading audio...")
+        self._show_busy(busy_text)
         def work():
             try:
                 td = _temp_dir()
                 for f in os.listdir(td):
                     if f.startswith('url_dl'):
                         os.remove(os.path.join(td, f))
+                # yt-dlp needs ffmpeg for the -x/--audio-format
+                # postprocessing step and does its own internal search
+                # for it (separate from our _find_tool fallback) — under
+                # a real Finder launch, PATH is minimal and that search
+                # comes up empty even though _find_tool() just found it
+                # fine, so tell yt-dlp exactly where it is explicitly.
+                cmd = [ytdlp, '-x', '--audio-format', 'wav',
+                       '-o', os.path.join(td, 'url_dl.%(ext)s'),
+                       '--no-playlist', '--no-warnings', url]
+                ffmpeg = _find_tool('ffmpeg')
+                if ffmpeg:
+                    cmd += ['--ffmpeg-location', ffmpeg]
                 subprocess.run(
-                    [ytdlp, '-x', '--audio-format', 'wav',
-                     '-o', os.path.join(td, 'url_dl.%(ext)s'),
-                     '--no-playlist', '--no-warnings', url],
-                    check=True, capture_output=True, text=True)
+                    cmd, check=True, capture_output=True, text=True,
+                    env=_external_env())
                 found = next((os.path.join(td, f) for f in sorted(os.listdir(td))
                               if f.startswith('url_dl')), None)
                 if found:
@@ -1844,10 +2078,139 @@ class NoteXNoteApp:
                 else:
                     self.root.after(0, lambda: self._load_err("Output file not found"))
             except subprocess.CalledProcessError as e:
-                self.root.after(0, lambda: self._load_err(e.stderr or str(e)))
+                reason = _extract_ytdlp_error(e.stderr)
+                if _retried:
+                    self.root.after(0, lambda: self._load_err(reason))
+                else:
+                    self.root.after(0, lambda: self._ytdlp_failed(ytdlp, url, busy_text, reason))
             except Exception as e:
-                self.root.after(0, lambda: self._load_err(str(e)))
+                # Must stringify e HERE, synchronously — CPython deletes
+                # the exception-clause variable the moment this except
+                # block exits, so a lambda that closes over `e` itself and
+                # calls str(e) only when root.after() later runs it hits
+                # "NameError: cannot access free variable 'e'" instead of
+                # ever showing the real error. Every deferred-lambda error
+                # handler in this file needs the str(e)/extraction done
+                # immediately and only the resulting plain string captured.
+                msg = str(e)
+                self.root.after(0, lambda: self._load_err(msg))
         threading.Thread(target=work, daemon=True).start()
+
+    def _ytdlp_failed(self, ytdlp, url, busy_text, reason):
+        self._hide_busy()
+        self.status.set("Download failed")
+        update = messagebox.askyesno(
+            "Download Failed",
+            "This download failed — most often that means yt-dlp is out "
+            "of date (YouTube changes frequently and yt-dlp needs to keep "
+            "up).\n\n"
+            f"Details: {reason[:300]}\n\n"
+            "Update yt-dlp now and try again?",
+            icon='warning')
+        if not update:
+            self._load_err(reason)
+            return
+        self._show_busy("Updating yt-dlp...")
+        def work():
+            try:
+                subprocess.run([ytdlp, '-U'], check=True,
+                               capture_output=True, text=True, timeout=60,
+                               env=_external_env())
+            except Exception:
+                pass  # best-effort — retry the download regardless
+            self.root.after(0, lambda: self._download_and_load(
+                url, busy_text, _retried=True))
+        threading.Thread(target=work, daemon=True).start()
+
+    # ── YouTube Search ──
+
+    def _yt_search(self):
+        query = self.yt_query_var.get().strip()
+        if not query:
+            return
+        # Guard against overlapping searches — pressing Enter/Search again
+        # while one's already running used to spawn a second concurrent
+        # yt-dlp process with no ordering guarantee on which result set
+        # wins, which reads as the search "hanging" even longer. Disabling
+        # the button also gives unambiguous feedback that it registered,
+        # instead of a barely-noticeable status-label change.
+        if self._yt_search_busy:
+            return
+        self._yt_search_busy = True
+        self._yt_search_token = getattr(self, '_yt_search_token', 0) + 1
+        my_token = self._yt_search_token
+        self.yt_search_btn.config(state='disabled')
+        self.yt_status_lbl.config(text="Searching…")
+        self.yt_listbox.delete(0, 'end')
+        self._yt_results = []
+        def work():
+            try:
+                results = _youtube_search(query, n=8)
+            except Exception as e:
+                msg = str(e)  # stringify now — see note in _download_and_load
+                self.root.after(0, lambda: self._yt_search_error(msg, my_token))
+                return
+            self.root.after(0, lambda: self._yt_search_done(results, my_token))
+        threading.Thread(target=work, daemon=True).start()
+        # Safety net: the subprocess itself has a 30s timeout, but if
+        # anything else goes wrong between here and there (a callback that
+        # never fires, an unexpected exception class, etc.) this guarantees
+        # the UI can't get stuck in "Searching…" forever. The token check
+        # keeps a late-firing watchdog from clobbering a newer search that
+        # started after this one's window closed.
+        self.root.after(35000, lambda: self._yt_search_watchdog(my_token))
+
+    def _yt_search_watchdog(self, token):
+        if self._yt_search_busy and self._yt_search_token == token:
+            self._yt_search_busy = False
+            self.yt_search_btn.config(state='normal')
+            self.yt_status_lbl.config(text="Search timed out — try again")
+
+    def _yt_search_error(self, msg, token):
+        if self._yt_search_token != token:
+            return  # superseded by a newer search — ignore this stale result
+        print(f"[yt-search] failed: {msg}", file=sys.stderr)
+        self._yt_search_busy = False
+        self.yt_search_btn.config(state='normal')
+        self.yt_status_lbl.config(text=f"Search failed: {msg}")
+
+    def _yt_search_done(self, results, token):
+        if self._yt_search_token != token:
+            return  # superseded — ignore
+        self._yt_search_busy = False
+        self.yt_search_btn.config(state='normal')
+        self._yt_results = results
+        self.yt_listbox.delete(0, 'end')
+        for r in results:
+            dur = _fmt_time(r['duration']) if r['duration'] else '--:--'
+            line = f"{dur}  {r['title']}"
+            if r['channel']:
+                line += f"  — {r['channel']}"
+            self.yt_listbox.insert('end', line)
+        self.yt_status_lbl.config(
+            text=f"{len(results)} result(s) — double-click to load"
+            if results else "No results")
+
+    def _yt_load_selected(self):
+        sel = self.yt_listbox.curselection()
+        if not sel or sel[0] >= len(self._yt_results):
+            return
+        info = self._yt_results[sel[0]]
+        self._download_and_load(info['url'], f'Downloading "{info["title"]}"...')
+        if self._youtube_video_renderer:
+            try:
+                self._youtube_video_renderer(self.yt_video_container, info)
+            except Exception as e:
+                print(f'[{APP_NAME}] youtube video renderer failed: {e}')
+
+    def set_youtube_renderer(self, fn):
+        """Plugin API: register fn(parent_frame, video_info) to render live
+        video into the YouTube panel's reserved container whenever a search
+        result is loaded. video_info is a dict:
+        {'title', 'duration', 'channel', 'url'}. Optional — without a
+        renderer registered, search results just load audio on click, same
+        as pasting a URL."""
+        self._youtube_video_renderer = fn
 
     def _fetch_spotify(self):
         url = self.url_var.get().strip()
@@ -1872,7 +2235,7 @@ class NoteXNoteApp:
                     [spotdl, 'download', url,
                      '--output', os.path.join(td, 'spot_{title}.{output-ext}')],
                     check=True, capture_output=True, text=True,
-                    timeout=120)
+                    timeout=120, env=_external_env())
                 found = next((os.path.join(td, f) for f in sorted(os.listdir(td))
                               if f.startswith('spot_')), None)
                 if found:
@@ -1883,9 +2246,11 @@ class NoteXNoteApp:
             except subprocess.TimeoutExpired:
                 self.root.after(0, lambda: self._load_err("Download timed out"))
             except subprocess.CalledProcessError as e:
-                self.root.after(0, lambda: self._load_err(e.stderr or str(e)))
+                reason = _extract_ytdlp_error(e.stderr)
+                self.root.after(0, lambda: self._load_err(reason))
             except Exception as e:
-                self.root.after(0, lambda: self._load_err(str(e)))
+                msg = str(e)
+                self.root.after(0, lambda: self._load_err(msg))
         threading.Thread(target=work, daemon=True).start()
 
     # ── Loading ──
@@ -1908,14 +2273,13 @@ class NoteXNoteApp:
                 self.engine.process()
                 self.root.after(0, lambda: self._loaded(path))
             except Exception as e:
-                self.root.after(0, lambda: self._load_err(str(e)))
+                msg = str(e)
+                self.root.after(0, lambda: self._load_err(msg))
         threading.Thread(target=work, daemon=True).start()
 
     def _show_raw_waveform(self, path):
         self.file_lbl.config(text=os.path.basename(path))
         self.waveform.set_segments([])
-        if hasattr(self, 'structure_lbl'):
-            self.structure_lbl.config(text='')
         self.waveform.set_audio(self.engine.original)
 
     def _loaded(self, path):
@@ -1941,7 +2305,6 @@ class NoteXNoteApp:
         if not eq_name or eq_name not in EQ_PRESETS:
             eq_name = 'Mid'
         self._eq_preset(eq_name)
-        self._refresh_loop_slots()
 
     def _load_err(self, msg):
         self._hide_busy()
@@ -1949,25 +2312,36 @@ class NoteXNoteApp:
         messagebox.showerror("Load Error",
                              f"{msg}\n\nMake sure ffmpeg is installed:\n  brew install ffmpeg")
 
+    def _eject_source(self):
+        """Unload the current song entirely — wired to the eject button
+        both next to Source and in the YouTube Search row. Blanks both
+        waveforms, the Source label, and the Time readout, matching the
+        "no source, no waveform" state a fresh launch already shows
+        correctly."""
+        if not self.engine.loaded or self._busy:
+            return
+        self._save_song()
+        self.engine.unload()
+        self.play_btn.config(text='▶')
+        self.file_lbl.config(text="No file loaded")
+        self.waveform.clear()
+        self.zoom_waveform.refresh()
+        self._refresh_loop()
+        self._update_time()
+        self.ref_btn.config(text="🎯  Play at 1× (Reference)",
+                            bg=self._ref_default_bg, fg='black')
+        self.status.set("Ready")
+
     # ── Speed / Pitch ──
 
     def _spd_slide(self, val=None):
         spd = self.spd_var.get()
         self.spd_input_var.set(f"{spd:.2f}")
-        if hasattr(self, '_spd_after') and self._spd_after is not None:
-            try:
-                self.root.after_cancel(self._spd_after)
-            except Exception:
-                pass
-        self._spd_after = self.root.after(300, lambda: self._apply_speed(spd))
+        # Debounce lives centrally in _request_reprocess() now (used by
+        # Speed and Pitch alike) — no separate one needed here.
+        self._apply_speed(spd)
 
     def _spd_preset(self, val):
-        if hasattr(self, '_spd_after') and self._spd_after is not None:
-            try:
-                self.root.after_cancel(self._spd_after)
-            except Exception:
-                pass
-            self._spd_after = None
         self.spd_var.set(val)
         self.spd_input_var.set(f"{val:.2f}")
         self._apply_speed(val)
@@ -1988,21 +2362,52 @@ class NoteXNoteApp:
         if not self.engine.loaded:
             self.engine.speed = spd
             return
-        # Coalesce rapid clicks/drags to one worker instead of queueing a
-        # full WSOLA pass per click — a click while one is already running
-        # just replaces the pending target. try/except around the actual
-        # work guarantees the busy flag always clears, even on failure —
-        # previously an exception mid-thread left self._busy stuck True
-        # forever, silently freezing Space and the transport Play button
-        # (both bail out early whenever self._busy is set).
         self._speed_pending = spd
-        if self._busy:
-            return
-        self._run_speed_worker()
+        self._request_reprocess()
 
-    def _run_speed_worker(self):
+    def _apply_pitch(self, semitones):
+        self.pitch_var.set(f"{semitones:+d} st" if semitones else "0 st")
+        if not self.engine.loaded:
+            self.engine.pitch_semitones = semitones
+            return
+        self._pitch_pending = semitones
+        self._request_reprocess()
+
+    # ── Reprocessing (shared by Speed and Pitch) ──
+
+    def _request_reprocess(self):
+        """Debounce + coalesce a reprocess for whatever's currently in
+        self._speed_pending / self._pitch_pending. Shared by Speed and
+        Pitch (both just end up calling engine.process()) rather than
+        each running its own separate worker+pending pair — with two
+        separate pairs, a click on one control while the other's worker
+        was still running got its pending value stranded, since each
+        worker's done-callback only ever checked its own flag. And a
+        300ms debounce (same window already used for the Speed slider's
+        drag) means a quick burst of clicks settles into exactly one
+        full WSOLA pass for the final value instead of a chain of full
+        passes each racing to catch up with the next click — confirmed
+        via screen recording: 5 pitch clicks + a speed change in ~15s of
+        real time took nearly 30s of continuous "Processing..." to fully
+        drain, one full-song pass at a time."""
+        if getattr(self, '_reprocess_after', None):
+            try:
+                self.root.after_cancel(self._reprocess_after)
+            except Exception:
+                pass
+        self._reprocess_after = self.root.after(300, self._reprocess_debounced)
+
+    def _reprocess_debounced(self):
+        self._reprocess_after = None
+        if self._busy:
+            return  # already running; its own done-callback re-checks both pending flags
+        self._run_reprocess_worker()
+
+    def _run_reprocess_worker(self):
         spd = self._speed_pending
+        st = self._pitch_pending
         self._speed_pending = None
+        self._pitch_pending = None
         if self.engine.reference_mode:
             self.engine.reference_mode = False
             if self.engine.original is not None and len(self.engine.original) > 0:
@@ -2021,23 +2426,34 @@ class NoteXNoteApp:
         def work():
             error = None
             try:
-                self.engine.process(speed=spd)
+                self.engine.process(speed=spd, pitch_semitones=st)
                 if self.engine.processed is not None:
                     self.engine.position = int(ratio * len(self.engine.processed))
             except Exception as e:
                 error = str(e)
-            self.root.after(0, lambda: self._speed_worker_done(was, error))
+            self.root.after(0, lambda: self._reprocess_done(was, error))
         threading.Thread(target=work, daemon=True).start()
 
-    def _speed_worker_done(self, was, error=None):
+    def _reprocess_done(self, was, error=None):
         self._hide_busy()
         if error:
-            self.status.set(f"Speed change failed: {error}")
+            self.status.set(f"Processing failed: {error}")
         elif was and self.engine.processed is not None:
             self.engine.play()
             self.play_btn.config(text='⏸')
-        if self._speed_pending is not None:
-            self._run_speed_worker()
+        if self._speed_pending is not None or self._pitch_pending is not None:
+            self._run_reprocess_worker()
+
+    # ── Pitch (semitone transpose) ──
+
+    def _pitch_step(self, delta, absolute=False):
+        cur = self._pitch_pending if self._pitch_pending is not None \
+            else self.engine.pitch_semitones
+        new_val = delta if absolute else cur + delta
+        new_val = max(PITCH_MIN_ST, min(PITCH_MAX_ST, new_val))
+        if new_val == cur:
+            return
+        self._apply_pitch(new_val)
 
     # ── Volume ──
 
@@ -2206,137 +2622,6 @@ class NoteXNoteApp:
             self.loop_lbl.config(text="No loop set")
         self.waveform._draw()
 
-    # ── Loop Slots ──
-
-    def _build_loop_slots(self, parent):
-        frame = ttk.LabelFrame(parent, text="Loop Library (5 slots)", padding=6)
-        frame.pack(fill='x', pady=(0, 4))
-        self.structure_lbl = ttk.Label(frame, text="",
-                                        font=('Menlo', 9),
-                                        foreground='#888')
-        self.structure_lbl.pack(anchor='w', pady=(0, 2))
-        self.slot_name_vars = []
-        self.slot_time_lbls = []
-        self.slot_data = [{'name': '', 'loop_a': None, 'loop_b': None}
-                          for _ in range(LOOP_SLOT_COUNT)]
-        for i in range(LOOP_SLOT_COUNT):
-            row = ttk.Frame(frame)
-            row.pack(fill='x', pady=(0 if i == 0 else 5, 0))
-            top = ttk.Frame(row)
-            top.pack(fill='x')
-            ttk.Label(top, text=f"{i + 1}", width=2,
-                      font=('Menlo', 10, 'bold')).pack(side='left')
-            name_var = tk.StringVar(value='')
-            self.slot_name_vars.append(name_var)
-            ent = ttk.Entry(top, textvariable=name_var)
-            ent.pack(side='left', padx=(2, 0), fill='x', expand=True)
-            ent.bind('<FocusOut>', lambda e, idx=i: self._slot_rename(idx))
-            ent.bind('<Return>', lambda e, idx=i: self._slot_rename(idx))
-            bottom = ttk.Frame(row)
-            bottom.pack(fill='x', pady=(2, 0))
-            tl = ttk.Label(bottom, text="—", width=13, font=('Menlo', 9))
-            tl.pack(side='left')
-            self.slot_time_lbls.append(tl)
-            ttk.Button(bottom, text="Save", width=4,
-                       command=lambda idx=i: self._slot_save(idx)).pack(side='left', padx=1)
-            ttk.Button(bottom, text="Load", width=4,
-                       command=lambda idx=i: self._slot_load(idx)).pack(side='left', padx=1)
-            ttk.Button(bottom, text="✕", width=2,
-                       command=lambda idx=i: self._slot_clear(idx)).pack(side='left', padx=1)
-            ttk.Button(bottom, text="↑", width=2,
-                       command=lambda idx=i: self._slot_move(idx, -1)).pack(side='left', padx=1)
-            ttk.Button(bottom, text="↓", width=2,
-                       command=lambda idx=i: self._slot_move(idx, 1)).pack(side='left', padx=1)
-            if i < LOOP_SLOT_COUNT - 1:
-                ttk.Separator(frame, orient='horizontal').pack(fill='x', pady=(4, 0))
-
-    def _refresh_loop_slots(self):
-        path = self.engine.file_path
-        if path:
-            self.slot_data = self.db.load_slots(path)
-        else:
-            self.slot_data = [{'name': '', 'loop_a': None, 'loop_b': None}
-                              for _ in range(LOOP_SLOT_COUNT)]
-        for i, slot in enumerate(self.slot_data):
-            self.slot_name_vars[i].set(slot['name'])
-            if slot['loop_a'] is not None and slot['loop_b'] is not None:
-                ta = _fmt_time(slot['loop_a'] / self.engine.sr)
-                tb = _fmt_time(slot['loop_b'] / self.engine.sr)
-                self.slot_time_lbls[i].config(text=f"{ta} → {tb}")
-            else:
-                self.slot_time_lbls[i].config(text="—")
-
-    def _slot_save(self, idx):
-        if not self.engine.file_path:
-            return
-        if self.engine.loop_a is None or self.engine.loop_b is None:
-            messagebox.showinfo("No loop",
-                                 "Set A and B first (in the A-B Loop section), then save into a slot.")
-            return
-        name = self.slot_name_vars[idx].get().strip()
-        if not name:
-            name = f"Loop {idx + 1}"
-            self.slot_name_vars[idx].set(name)
-        self.slot_data[idx] = {'name': name,
-                                'loop_a': self.engine.loop_a,
-                                'loop_b': self.engine.loop_b}
-        self.db.save_slot(self.engine.file_path, idx, name,
-                          self.engine.loop_a, self.engine.loop_b)
-        ta = _fmt_time(self.engine.loop_a / self.engine.sr)
-        tb = _fmt_time(self.engine.loop_b / self.engine.sr)
-        self.slot_time_lbls[idx].config(text=f"{ta} → {tb}")
-
-    def _slot_load(self, idx):
-        slot = self.slot_data[idx]
-        if slot['loop_a'] is None or slot['loop_b'] is None:
-            return
-        self.engine.loop_a = int(slot['loop_a'])
-        self.engine.loop_b = int(slot['loop_b'])
-        self._refresh_loop()
-
-    def _slot_clear(self, idx):
-        if self.engine.file_path:
-            self.db.clear_slot(self.engine.file_path, idx)
-        self.slot_data[idx] = {'name': '', 'loop_a': None, 'loop_b': None}
-        self.slot_name_vars[idx].set('')
-        self.slot_time_lbls[idx].config(text="—")
-
-    def _slot_rename(self, idx):
-        if not self.engine.file_path:
-            return
-        name = self.slot_name_vars[idx].get().strip()
-        slot = self.slot_data[idx]
-        slot['name'] = name
-        if slot['loop_a'] is not None and slot['loop_b'] is not None:
-            self.db.save_slot(self.engine.file_path, idx, name,
-                              slot['loop_a'], slot['loop_b'])
-
-    def _slot_move(self, idx, direction):
-        if not self.engine.file_path:
-            return
-        new_idx = idx + direction
-        if new_idx < 0 or new_idx >= LOOP_SLOT_COUNT:
-            return
-        self.slot_data[idx], self.slot_data[new_idx] = self.slot_data[new_idx], self.slot_data[idx]
-        # Persist both rows
-        for i in (idx, new_idx):
-            s = self.slot_data[i]
-            if s['loop_a'] is not None and s['loop_b'] is not None:
-                self.db.save_slot(self.engine.file_path, i, s['name'],
-                                  s['loop_a'], s['loop_b'])
-            else:
-                self.db.clear_slot(self.engine.file_path, i)
-        # Refresh both rows' UI
-        for i in (idx, new_idx):
-            s = self.slot_data[i]
-            self.slot_name_vars[i].set(s['name'])
-            if s['loop_a'] is not None and s['loop_b'] is not None:
-                ta = _fmt_time(s['loop_a'] / self.engine.sr)
-                tb = _fmt_time(s['loop_b'] / self.engine.sr)
-                self.slot_time_lbls[i].config(text=f"{ta} → {tb}")
-            else:
-                self.slot_time_lbls[i].config(text="—")
-
     # ── Menubar / Plugin surface ──
 
     def _build_menubar(self):
@@ -2476,40 +2761,12 @@ class NoteXNoteApp:
 
     def _clear_sections(self):
         self.waveform.set_segments([])
-        if hasattr(self, 'structure_lbl'):
-            self.structure_lbl.config(text='')
 
     # ── Plugin-facing helpers (stable API for plugins) ──
 
     def set_segments(self, segments):
         """Plugins call this to display detected sections on the waveform."""
         self.waveform.set_segments(segments or [])
-        if hasattr(self, 'structure_lbl'):
-            pattern = ' • '.join(s.get('tag', '?') for s in (segments or []))
-            self.structure_lbl.config(text=pattern)
-
-    def autofill_loop_slots(self, segments, max_slots=LOOP_SLOT_COUNT):
-        """Populate loop library with the first N distinct segments."""
-        seen = set()
-        picks = []
-        for seg in segments:
-            n = seg.get('name', '')
-            if n in seen:
-                continue
-            seen.add(n)
-            picks.append(seg)
-            if len(picks) >= max_slots:
-                break
-        for i, seg in enumerate(picks):
-            a = int(seg['start'] * self.engine.sr)
-            b = int(seg['end'] * self.engine.sr)
-            self.slot_data[i] = {'name': seg['name'], 'loop_a': a, 'loop_b': b}
-            if self.engine.file_path:
-                self.db.save_slot(self.engine.file_path, i, seg['name'], a, b)
-            self.slot_name_vars[i].set(seg['name'])
-            self.slot_time_lbls[i].config(
-                text=f"{_fmt_time(a / self.engine.sr)} → {_fmt_time(b / self.engine.sr)}")
-        return len(picks)
 
     def _on_segment_click(self, seg):
         if self.engine.original is None:
@@ -2552,13 +2809,22 @@ class NoteXNoteApp:
 
     # ── Busy indicator ──
 
+    # A full-song WSOLA pass on a long track at slow speed (plus a pitch
+    # shift, which adds its own resample pass) can genuinely take 20+
+    # real seconds — measured 23.56s for a 6:59 song at 0.5x with a
+    # semitone shift. The old first checkpoint at 30s meant that entire
+    # wait showed a static, unchanging "Processing..." the whole time,
+    # indistinguishable from a hang. First ping quickly, then a steady
+    # ~15s heartbeat after that, so a long pass gets repeated
+    # acknowledgment throughout instead of one checkpoint near the end.
     _BUSY_STAGES = [
         (0,   "{text}"),
-        (30,  "Still {verb}..."),
-        (60,  "and still {verb}..."),
-        (90,  "and still {verb}..."),
-        (120, "yep, still {verb}..."),
-        (180, "hang tight, {verb}..."),
+        (5,   "Still {verb}..."),
+        (20,  "Still {verb}... (long or slow-speed songs take longer)"),
+        (35,  "Still {verb}..."),
+        (50,  "Still {verb}... hang tight"),
+        (65,  "Still {verb}... this one's taking a while"),
+        (95,  "Still {verb}... sorry for the wait"),
     ]
 
     def _show_busy(self, text):
@@ -2567,6 +2833,7 @@ class NoteXNoteApp:
         # Derive a verb from the initial message ("Loading audio..." → "loading")
         first_word = text.split()[0] if text else "working"
         self._busy_verb = first_word.rstrip('.').lower()
+        self.waveform.set_busy(True)
         self._spinner.place(relx=0.5, rely=0.5, anchor='center', y=-16)
         self._spin_lbl.config(text=text)
         self._spin_lbl.place(relx=0.5, rely=1.0, anchor='s', y=-6)
@@ -2606,9 +2873,18 @@ class NoteXNoteApp:
             except Exception:
                 pass
             self._busy_after = None
-        self._spinner.stop()
+        # Redraw the real waveform first, while still hidden behind the
+        # spinner, so there's no frame where the spinner is gone but the
+        # canvas is still the blank busy placeholder underneath it.
+        self.waveform.set_busy(False)
+        # Hide first, *then* reset to frame 0 — stop() snaps the visible
+        # image back to frame 0 immediately, so calling it before
+        # place_forget() let that snap flash on screen for a moment right
+        # as the waveform underneath was also updating, looking like a
+        # rendering glitch. Hiding first means the reset happens off-screen.
         self._spinner.place_forget()
         self._spin_lbl.place_forget()
+        self._spinner.stop()
         self.status.set("Ready")
 
     # ── Tick ──
@@ -2646,7 +2922,8 @@ class NoteXNoteApp:
             self.db.save(self.engine.file_path, self.engine.speed,
                          self.engine.pitch_lock,
                          self.engine.loop_a, self.engine.loop_b,
-                         self.engine.position, self._eq_active)
+                         self.engine.position, self._eq_active,
+                         self.engine.pitch_semitones)
 
     def _quit(self):
         self._save_song()

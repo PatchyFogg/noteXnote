@@ -80,7 +80,7 @@
 <p class="tagline">Slow it down. Loop it. Learn it.</p>
 
 <div class="box">
-Quick start: open a song from the <b>Source</b> panel, hit <kbd>Space</kbd>
+Quick start: open a song from the <b>Source</b> panel, hit <b>▶</b>
 to play, and drag the <b>Speed</b> slider down to slow it to whatever
 tempo you want to play along with, keeping the original pitch if
 <b>Pitch Lock</b> is on.
@@ -92,7 +92,9 @@ The <b>Source</b> panel supports a local audio file, a pasted URL
 (YouTube, SoundCloud, Bandcamp, and 1000+ sites via <code>yt-dlp</code>),
 or a Spotify link (via <code>spotdl</code>). The folder-shortcut button
 (📁) next to Open jumps straight to any music folders noteXnote finds on
-your Mac.
+your Mac. The eject button (⏏) unloads the current song entirely —
+clears both waveforms, the loop, and the Source label. The same
+button appears next to YouTube Search below.
 </p>
 
 <h2>Speed &amp; Pitch Lock</h2>
@@ -104,6 +106,17 @@ sounds like the same riff, not a chipmunk. Under the hood this is WSOLA
 time-stretching with normalized-correlation splice matching, tuned to
 avoid the phasey "echo" artifact that cheaper time-stretchers produce on
 reverb-heavy recordings.
+</p>
+
+<h2>Pitch</h2>
+<p>
+Transpose a song up or down in half-step (semitone) intervals — up to an
+octave either way — with the <b>−</b> / <b>+</b> buttons in the Pitch
+section, or jump back to the original key with <b>Reset</b>. This is
+independent of the Speed control: transposing never changes tempo, and
+works whether Pitch Lock is on or off. Useful for matching a song to a
+capo position, a differently-tuned instrument, or a singer's range
+without touching playback speed.
 </p>
 
 <h2>D/A Reconstruction Filter</h2>
@@ -123,13 +136,21 @@ how the part is actually supposed to sound — then jump right back into
 practice speed.
 </p>
 
-<h2>A-B Loop &amp; Loop Library</h2>
+<h2>A-B Loop</h2>
 <p>
-Set <b>A</b> and <b>B</b> points anywhere in the song to loop just that
-section on repeat. The <b>Loop Library</b> holds up to 5 named loops per
-song — save the intro, the tricky bridge run, the solo — and jump between
-them with one click. Everything is remembered per-song, so it's all still
-there next time you open the same file.
+Click <b>Set Start</b> and <b>Set End</b> anywhere in the song to loop just
+that section on repeat, or <b>Clear</b> to stop looping. The loop region is
+remembered per-song, so it's still there next time you open the same file.
+</p>
+
+<h2>YouTube Search</h2>
+<p>
+Type a search into the box under <b>Source</b> and hit Enter (or click
+<b>Search</b>) to find a track directly from YouTube — no need to leave the
+app to find a URL first. Double-click a result (or select it and press
+Enter) to load its audio straight into the practice engine, exactly like
+Paste URL. The eject button (⏏) unloads whatever's currently loaded,
+same as the one next to Source.
 </p>
 
 <h2>Zoom view</h2>
@@ -137,7 +158,8 @@ there next time you open the same file.
 Below the main waveform, the <b>Zoom</b> panel is a DAW-style detail view
 that scrolls under a fixed center playhead as you play, with a
 millisecond-precision time ruler. Click or drag inside it to seek with
-much finer granularity than the overview waveform allows.
+much finer granularity than the overview waveform allows, or scroll your
+mouse/trackpad over either waveform to scrub forward and back.
 </p>
 
 <h2>EQ — Boost</h2>
@@ -150,7 +172,6 @@ never hit clipping, no matter how hot the source mix is.
 <h2>Transport &amp; keyboard shortcuts</h2>
 <table>
   <tr><th>Key</th><th>Action</th></tr>
-  <tr><td><kbd>Space</kbd></td><td>Play / Pause</td></tr>
   <tr><td><kbd>←</kbd></td><td>Rewind a few seconds</td></tr>
   <tr><td><kbd>→</kbd></td><td>Fast-forward a few seconds</td></tr>
   <tr><td><kbd>⌘O</kbd></td><td>Open a file</td></tr>
