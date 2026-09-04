@@ -9,7 +9,7 @@ it's second nature, and hear it without the harsh edges digital audio
 usually carries.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-4dd0e1.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-macOS%2010.15+-ff6b35.svg)](#requirements)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Windows-ff6b35.svg)](#requirements)
 [![Release](https://img.shields.io/github/v/release/PatchyFogg/noteXnote?color=8888aa&label=release)](https://github.com/PatchyFogg/noteXnote/releases)
 
 </div>
@@ -53,15 +53,19 @@ Practice for hours without your ears getting tired.
 
 ## Requirements
 
-- macOS 10.15+
-- [`ffmpeg`](https://ffmpeg.org) — `brew install ffmpeg`
+- macOS 10.15+ or Windows 10+
+- [`ffmpeg`](https://ffmpeg.org) — `brew install ffmpeg` (macOS) or `winget install ffmpeg` (Windows)
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) for Paste URL, [`spotdl`](https://github.com/spotDL/spotify-downloader) for Spotify — both optional
 
 ## Installing
 
-Download `noteXnote.dmg` from the latest [release](../../releases), open it, and drag noteXnote into Applications.
+**macOS:** download `noteXnote.dmg` from the latest [release](../../releases), open it, and drag noteXnote into Applications.
+
+**Windows:** build from source (below) — a prebuilt `.exe` isn't published yet.
 
 ## Building from source
+
+**macOS:**
 
 ```bash
 git clone https://github.com/PatchyFogg/noteXnote.git
@@ -71,7 +75,17 @@ cd noteXnote
 
 This creates a Homebrew-Python virtualenv, installs dependencies, and produces both `dist/noteXnote.app` and `noteXnote.dmg`.
 
-Sanity-check the core audio pipeline (WSOLA, EQ, the D/A filter, the limiter, SQLite, bundled resources) without launching the GUI:
+**Windows** (PowerShell):
+
+```powershell
+git clone https://github.com/PatchyFogg/noteXnote.git
+cd noteXnote
+.\build_win.ps1
+```
+
+This creates a virtualenv, installs dependencies, and produces `dist\noteXnote.exe` via PyInstaller. Newer than the macOS build and less battle-tested — file an issue if something's off.
+
+Sanity-check the core audio pipeline (WSOLA, EQ, the D/A filter, the limiter, SQLite, bundled resources) without launching the GUI, on either platform:
 
 ```bash
 python notexnote.py --selftest
@@ -83,7 +97,7 @@ The core app stays exactly as it is; new capabilities ship as reviewed plugins, 
 
 ## Uninstalling
 
-**Help → Uninstall noteXnote…** inside the app removes noteXnote and all of its saved data in one step.
+**Help → Uninstall noteXnote…** inside the app removes all of its saved data in one step. On macOS this also removes the app bundle itself; on Windows, delete the noteXnote folder yourself afterward — there's no single standard install location to automate that part of.
 
 ## License
 
