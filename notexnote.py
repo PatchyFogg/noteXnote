@@ -1647,7 +1647,8 @@ class NoteXNoteApp:
     def _load_prefs(self):
         self.prefs = {'speed': 1.0, 'pitch_lock': True, 'volume': 0.5,
                       'last_dir': os.path.expanduser('~/Music'),
-                      'geometry': '1481x1035', 'source': 'local'}
+                      'geometry': '1481x1035', 'source': 'local',
+                      'music_scan_consent': None}
         try:
             with open(_prefs_path()) as f:
                 self.prefs.update(json.load(f))
@@ -1679,20 +1680,28 @@ class NoteXNoteApp:
 
     def _build_ui(self):
         self._build_menubar()
-        # Buttons never take keyboard focus. Tk gives any focused button
-        # its own default binding where <space>/<Return> re-invokes that
-        # button's command — separate from and in addition to any of our
-        # own key bindings elsewhere. With as many buttons as this app has
-        # (Transport, EQ, Speed/Pitch presets, search...), a click leaves
-        # some button focused, and the next unrelated keypress can
-        # silently re-trigger it (confirmed: a Pitch +/- click followed by
-        # any Space press re-applied the same step, making one semitone
-        # sound like a whole step). This is the actual fix, not removing
-        # individual key bindings one at a time as each button's focus
-        # happens to surface the problem again.
+        # Tk gives any focused button its own default binding where
+        # <space>/<Return> re-invokes that button's command — separate
+        # from and in addition to any of our own key bindings elsewhere.
+        # With as many buttons as this app has (Transport, EQ, Speed/Pitch
+        # presets, search...), a click leaves some button focused, and the
+        # next unrelated Space press can silently re-trigger it (confirmed:
+        # a Pitch +/- click followed by any Space press re-applied the
+        # same step, making one semitone sound like a whole step).
+        #
+        # takefocus=0 alone does NOT fix this — takefocus only excludes a
+        # widget from Tab-key traversal, it doesn't stop a mouse click from
+        # giving that widget real keyboard focus (verified: focus_force()
+        # on a takefocus=0 button still lands focus on it, and <space>
+        # still fires its command). The actual fix has to override the
+        # button classes' own <space> binding directly, at the class
+        # bindtag level, so it's dead regardless of which button — old or
+        # newly added — happens to hold focus.
         style = ttk.Style()
         style.configure('TButton', takefocus=0)
         style.configure('TCheckbutton', takefocus=0)
+        for cls in ('TButton', 'TCheckbutton', 'Button'):
+            self.root.bind_class(cls, '<space>', lambda e: 'break')
         main = ttk.Frame(self.root)
         main.pack(fill='both', expand=True, padx=8, pady=8)
         paned = ttk.PanedWindow(main, orient='horizontal')
@@ -2006,22 +2015,47 @@ class NoteXNoteApp:
             self._load(path)
 
     def _open_shortcut_menu(self):
-        """Popup menu of detected music folder shortcuts."""
+        """Popup menu of detected music folder shortcuts.
+
+        Gated behind our own explicit yes/no, asked once and remembered —
+        macOS's own Music/Downloads permission prompt exists, but a plain
+        unsandboxed os.listdir() from this app isn't reliably blocked by a
+        "Don't Allow" on it, so the app has to be the one that actually
+        honors a no rather than assuming the OS already did."""
+        consent = self.prefs.get('music_scan_consent')
+        if consent is None:
+            consent = messagebox.askyesno(
+                "Look for music folders?",
+                "noteXnote can jump straight to folders it finds on your "
+                "Mac (~/Music, ~/Downloads, and any mounted volumes) — "
+                "macOS may ask permission the first time. Only folder "
+                "names are read, nothing is sent anywhere. Look now?")
+            self.prefs['music_scan_consent'] = consent
+            self._save_prefs()
         menu = tk.Menu(self.root, tearoff=0)
-        shortcuts = _find_music_dirs()
-        if not shortcuts:
-            menu.add_command(label="No music folders detected", state='disabled')
+        if not consent:
+            menu.add_command(label="Folder shortcuts declined", state='disabled')
+            menu.add_command(label="Enable folder shortcuts…",
+                              command=self._reenable_folder_shortcuts)
         else:
-            for label, path in shortcuts:
-                menu.add_command(
-                    label=f"{label}   ({path})",
-                    command=lambda p=path: self._open_file(initial=p))
+            shortcuts = _find_music_dirs()
+            if not shortcuts:
+                menu.add_command(label="No music folders detected", state='disabled')
+            else:
+                for label, path in shortcuts:
+                    menu.add_command(
+                        label=f"{label}   ({path})",
+                        command=lambda p=path: self._open_file(initial=p))
         try:
             x = self.folders_btn.winfo_rootx()
             y = self.folders_btn.winfo_rooty() + self.folders_btn.winfo_height()
             menu.tk_popup(x, y)
         finally:
             menu.grab_release()
+
+    def _reenable_folder_shortcuts(self):
+        self.prefs['music_scan_consent'] = None
+        self._save_prefs()
 
     def _fetch_source(self):
         if self.src_var.get() == 'Spotify':
