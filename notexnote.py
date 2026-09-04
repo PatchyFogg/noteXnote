@@ -15,17 +15,7 @@ import os
 import json
 import tempfile
 import math
-import string
 from pathlib import Path
-
-IS_MAC = sys.platform == 'darwin'
-IS_WIN = sys.platform == 'win32'
-
-# Menlo/Helvetica are macOS system fonts with no guaranteed presence on
-# Windows; Consolas/Segoe UI are the closest near-universal equivalents
-# shipped with Windows itself.
-MONO_FONT = 'Menlo' if IS_MAC else 'Consolas'
-UI_FONT = 'Helvetica' if IS_MAC else 'Segoe UI'
 
 # ─── Constants ────────────────────────────────────────────────────────
 
@@ -51,15 +41,6 @@ PITCH_MAX_ST = 12
 
 _BREW_PATHS = ['/usr/local/bin', '/opt/homebrew/bin',
                os.path.expanduser('~/bin'), '/usr/bin']
-
-
-def _install_hint(tool):
-    """Platform-appropriate install instructions for an external tool
-    missing from PATH — Homebrew on macOS, winget on Windows (both real,
-    common package managers; winget ships with Windows 10 1809+/11)."""
-    if IS_WIN:
-        return f"winget install {tool}"
-    return f"brew install {tool}"
 
 _EXTERNAL_ENV_STRIP = (
     'DYLD_LIBRARY_PATH', 'DYLD_FALLBACK_LIBRARY_PATH',
@@ -91,17 +72,10 @@ def _external_env():
 
 
 def _find_tool(name):
-    """Find an external tool. PATH first (shutil.which already resolves
-    the .exe/.bat/etc extension via PATHEXT on Windows, no help needed
-    here), then the common Homebrew install locations that don't always
-    make it onto PATH in a Finder-launched app's minimal environment — a
-    macOS-only quirk, so skipped on Windows, where winget/choco/scoop
-    installs are already on PATH properly."""
+    """Find an external tool, checking Homebrew paths first."""
     found = shutil.which(name)
     if found:
         return found
-    if IS_WIN:
-        return None
     for d in _BREW_PATHS:
         p = os.path.join(d, name)
         if os.path.isfile(p) and os.access(p, os.X_OK):
@@ -129,7 +103,7 @@ def _youtube_search(query, n=8):
     yt-dlp's actual error message, not just "exit status 1"."""
     ytdlp = _find_tool('yt-dlp')
     if not ytdlp:
-        raise RuntimeError(f"yt-dlp not found. Install with: {_install_hint('yt-dlp')}")
+        raise RuntimeError("yt-dlp not found. Install with: brew install yt-dlp")
     try:
         result = subprocess.run(
             [ytdlp, f'ytsearch{n}:{query}', '--flat-playlist', '-J', '--no-warnings'],
@@ -161,13 +135,7 @@ GRID = '#252540'
 
 
 def _data_dir():
-    if IS_WIN:
-        base = os.environ.get('APPDATA') or os.path.expanduser('~')
-        d = os.path.join(base, APP_NAME)
-    elif IS_MAC:
-        d = os.path.expanduser(f'~/Library/Application Support/{APP_NAME}')
-    else:
-        d = os.path.expanduser(f'~/.{APP_NAME.lower()}')
+    d = os.path.expanduser(f'~/Library/Application Support/{APP_NAME}')
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -183,11 +151,9 @@ def _prefs_path():
 
 
 def _resource_path(filename):
-    """Locate a bundled resource — works running from source, from the
-    packaged macOS .app (py2app sets RESOURCEPATH to Contents/Resources),
-    and from a packaged Windows .exe (PyInstaller unpacks bundled data
-    files to sys._MEIPASS at runtime)."""
-    res_dir = os.environ.get('RESOURCEPATH') or getattr(sys, '_MEIPASS', None)
+    """Locate a bundled resource — works both running from source and from
+    the packaged .app (py2app sets RESOURCEPATH to Contents/Resources)."""
+    res_dir = os.environ.get('RESOURCEPATH')
     if res_dir:
         p = os.path.join(res_dir, filename)
         if os.path.isfile(p):
@@ -198,13 +164,9 @@ def _resource_path(filename):
 def _resolve_alias(path):
     """Resolve a macOS Finder alias file to its target POSIX path.
 
-    Returns `path` unchanged if it isn't a valid alias — always the case
-    on Windows, which has no equivalent to the classic Finder alias (a
-    .lnk shortcut is a different file format entirely and isn't resolved
-    here; the folders _find_music_dirs() scans are real directories, not
-    shortcuts, so this is a no-op there rather than a missing feature).
+    Returns `path` unchanged if it isn't a valid alias.
     """
-    if not IS_MAC or not os.path.isfile(path):
+    if not os.path.isfile(path):
         return path
     try:
         script = (f'tell application "Finder" to POSIX path of '
@@ -220,14 +182,10 @@ def _resolve_alias(path):
 
 
 def _find_music_dirs():
-    """Return a list of (label, path) shortcuts to music folders on this
-    computer. ~/Music and ~/Downloads resolve correctly on any platform
-    via expanduser; the "other attached storage" scan is platform-specific
-    since macOS and Windows expose it completely differently — mounted
-    volumes under /Volumes vs. other drive letters — and macOS additionally
-    gets a check for Apple Music's own nested library folder, which has no
-    Windows equivalent. Excludes the .musiclibrary Apple Music database
-    (not useful for browsing).
+    """Return a list of (label, path) shortcuts to music folders on this Mac.
+
+    Scans typical Apple Music paths, mounted volumes, and ~/Music aliases.
+    Excludes the .musiclibrary Apple Music database (not useful for browsing).
     """
     seen = set()
     results = []
@@ -249,23 +207,15 @@ def _find_music_dirs():
         results.append((label, p))
 
     add('Home Music', '~/Music')
+    add('Music/Music', '~/Music/Music')
     add('Downloads', '~/Downloads')
-    if IS_MAC:
-        add('Music/Music', '~/Music/Music')
-        try:
-            for vol in sorted(os.listdir('/Volumes')):
-                base = f'/Volumes/{vol}'
-                add(f'{vol} / Music', f'{base}/Music/Music')
-                add(f'{vol}', f'{base}/Music')
-        except OSError:
-            pass
-    elif IS_WIN:
-        home_drive = os.path.splitdrive(os.path.expanduser('~'))[0].upper()
-        for letter in string.ascii_uppercase:
-            drive = f'{letter}:\\'
-            if drive.rstrip('\\') == home_drive or not os.path.exists(drive):
-                continue
-            add(f'{letter}: Music', f'{drive}Music')
+    try:
+        for vol in sorted(os.listdir('/Volumes')):
+            base = f'/Volumes/{vol}'
+            add(f'{vol} / Music', f'{base}/Music/Music')
+            add(f'{vol}', f'{base}/Music')
+    except OSError:
+        pass
     return results
 
 
@@ -1401,7 +1351,7 @@ class WaveformView(tk.Canvas):
         self.create_line(0, cy, w, cy, fill=GRID, width=1)
         if self._peaks is None:
             self.create_text(w // 2, cy, text="No audio loaded",
-                             fill='#666', font=(UI_FONT, 14))
+                             fill='#666', font=('Helvetica', 14))
             return
         peaks = np.interp(np.linspace(0, 1, w), np.linspace(0, 1, len(self._peaks)), self._peaks)
         rms = np.interp(np.linspace(0, 1, w), np.linspace(0, 1, len(self._rms)), self._rms)
@@ -1419,7 +1369,7 @@ class WaveformView(tk.Canvas):
                         self.create_text((x0 + x1) / 2, strip_h / 2,
                                          text=seg['name'],
                                          fill='#111', anchor='center',
-                                         font=(UI_FONT, 9, 'bold'))
+                                         font=('Helvetica', 9, 'bold'))
         # Loop region
         if (self.engine.loop_a is not None and self.engine.loop_b is not None
                 and self.engine.original is not None):
@@ -1430,9 +1380,9 @@ class WaveformView(tk.Canvas):
             self.create_line(la, wave_top, la, h, fill=LOOP_EDGE, width=2)
             self.create_line(lb, wave_top, lb, h, fill=LOOP_EDGE, width=2)
             self.create_text(la + 4, wave_top + 4, text='A', fill='#8899ff',
-                             anchor='nw', font=(UI_FONT, 9, 'bold'))
+                             anchor='nw', font=('Helvetica', 9, 'bold'))
             self.create_text(lb - 4, wave_top + 4, text='B', fill='#8899ff',
-                             anchor='ne', font=(UI_FONT, 9, 'bold'))
+                             anchor='ne', font=('Helvetica', 9, 'bold'))
         # Peak polygon
         margin = 4
         amp = wave_h / 2 - margin
@@ -1548,7 +1498,7 @@ class ZoomedWaveformView(tk.Canvas):
                 self.create_line(x, 0, x, h, fill=GRID, width=1)
             self.create_line(0, cy, w, cy, fill=GRID, width=1)
             self.create_text(w // 2, cy, text="No audio loaded",
-                             fill='#666', font=(UI_FONT, 14))
+                             fill='#666', font=('Helvetica', 14))
             return
         sr = self.engine.sr
         pos = self.engine.ref_position if self.engine.reference_mode else self.engine.position
@@ -1578,7 +1528,7 @@ class ZoomedWaveformView(tk.Canvas):
                     self.create_line(x, ruler_h, x, h, fill=GRID, width=1)
                     self.create_line(x, 0, x, ruler_h, fill='#888', width=1)
                     self.create_text(x + 2, 1, text=_fmt_time(max(0, t)),
-                                     fill='#aaa', anchor='nw', font=(MONO_FONT, 8))
+                                     fill='#aaa', anchor='nw', font=('Menlo', 8))
                 else:
                     self.create_line(x, ruler_h * 0.5, x, ruler_h, fill='#555', width=1)
             t += self.TICK_INTERVAL
@@ -1636,7 +1586,7 @@ class ZoomedWaveformView(tk.Canvas):
         self.create_rectangle(lx - label_w / 2, wave_top + 2, lx + label_w / 2, wave_top + 18,
                               fill=WAVE_BG, outline=PLAYHEAD, width=1)
         self.create_text(lx, wave_top + 10, text=label, fill=PLAYHEAD,
-                         font=(MONO_FONT, 11, 'bold'))
+                         font=('Menlo', 11, 'bold'))
 
     def _time_at_x(self, x, w):
         return self._win_start + (x / max(1, w)) * self._win_span
@@ -1794,7 +1744,7 @@ class NoteXNoteApp:
         ttk.Button(url_row, text="Fetch", width=6,
                    command=self._fetch_source).pack(side='right', padx=(4, 0))
         self.url_hint = ttk.Label(self.url_frame, text="",
-                                   foreground='gray', font=(UI_FONT, 10))
+                                   foreground='gray', font=('Helvetica', 10))
         self.url_hint.pack(anchor='w', pady=(2, 0))
         self._src_changed()
 
@@ -1828,7 +1778,7 @@ class NoteXNoteApp:
         self.yt_listbox = tk.Listbox(
             yt_list_row, height=6, bg='#22223a', fg='#e0e0e8',
             selectbackground='#4dd0e1', selectforeground='#111',
-            highlightthickness=0, bd=0, font=(UI_FONT, 10),
+            highlightthickness=0, bd=0, font=('Helvetica', 10),
             yscrollcommand=yt_scroll.set)
         yt_scroll.config(command=self.yt_listbox.yview)
         self.yt_listbox.pack(side='left', fill='both', expand=True)
@@ -1837,7 +1787,7 @@ class NoteXNoteApp:
         self.yt_listbox.bind('<Return>', lambda e: self._yt_load_selected())
 
         self.yt_status_lbl = ttk.Label(yt, text="", foreground='#888',
-                                        font=(UI_FONT, 9))
+                                        font=('Helvetica', 9))
         self.yt_status_lbl.pack(anchor='w', pady=(2, 0))
 
         # Reserved for a video-renderer plugin — empty otherwise
@@ -1863,7 +1813,7 @@ class NoteXNoteApp:
         self._spinner = ProgressIndicator(
             self.waveform, _resource_path('progress.gif'), fps=16, scale=2)
         self._spin_lbl = tk.Label(self.waveform, text="", bg=WAVE_BG,
-                                   fg='#ccc', font=(UI_FONT, 11, 'bold'))
+                                   fg='#ccc', font=('Helvetica', 11, 'bold'))
         time_bar = ttk.LabelFrame(left, text="Time", padding=6)
         time_bar.pack(fill='x', pady=(8, 0), padx=(0, 4))
         # LCD-style digital counter — dark panel, big bright current time,
@@ -1875,11 +1825,11 @@ class NoteXNoteApp:
         time_row = tk.Frame(lcd, bg='#0a0a0a')
         time_row.pack()
         self.time_lbl = tk.Label(time_row, text="00:00:00.00", bg='#0a0a0a',
-                                  fg=PLAYHEAD, font=(MONO_FONT, 26, 'bold'),
+                                  fg=PLAYHEAD, font=('Menlo', 26, 'bold'),
                                   anchor='w')
         self.time_lbl.pack(side='left')
         self.time_tot_lbl = tk.Label(time_row, text="/ 00:00", bg='#0a0a0a',
-                                      fg='white', font=(MONO_FONT, 13),
+                                      fg='white', font=('Menlo', 13),
                                       anchor='w')
         self.time_tot_lbl.pack(side='left', padx=(10, 0), pady=(10, 0))
 
@@ -1908,12 +1858,12 @@ class NoteXNoteApp:
         self.spd_input_var = tk.StringVar(value=f"{self.engine.speed:.2f}")
         spd_entry = ttk.Entry(spd_disp_row, textvariable=self.spd_input_var,
                                width=5, justify='right',
-                               font=(MONO_FONT, 14, 'bold'))
+                               font=('Menlo', 14, 'bold'))
         spd_entry.pack(side='left')
         spd_entry.bind('<Return>', self._spd_typed)
         spd_entry.bind('<FocusOut>', self._spd_typed)
         ttk.Label(spd_disp_row, text="x",
-                   font=(MONO_FONT, 14, 'bold')).pack(side='left')
+                   font=('Menlo', 14, 'bold')).pack(side='left')
         FaderSlider(spd, self.spd_var, from_=MAX_SPEED, to=MIN_SPEED,
                     length=240, orient='horizontal',
                     accent='#4dd0e1', snap_to=1.0,
@@ -1942,7 +1892,7 @@ class NoteXNoteApp:
                    command=lambda: self._pitch_step(-1)).pack(side='left')
         self.pitch_var = tk.StringVar(value="0 st")
         ttk.Label(pit_row, textvariable=self.pitch_var, width=7,
-                  anchor='center', font=(MONO_FONT, 14, 'bold')).pack(side='left', padx=4)
+                  anchor='center', font=('Menlo', 14, 'bold')).pack(side='left', padx=4)
         ttk.Button(pit_row, text="+", width=3,
                    command=lambda: self._pitch_step(1)).pack(side='left')
         ttk.Button(pit_row, text="Reset", width=6,
@@ -1987,7 +1937,7 @@ class NoteXNoteApp:
         ref = ttk.LabelFrame(right, text="Reference", padding=4)
         ref.pack(fill='x', pady=(0, 4))
         self.ref_btn = tk.Button(ref, text="\U0001f3af  Play at 1× (Reference)",
-                                  font=(UI_FONT, 11),
+                                  font=('Helvetica', 11),
                                   relief='raised', bd=2,
                                   command=self._toggle_reference,
                                   activebackground='#ffb347',
@@ -2015,7 +1965,7 @@ class NoteXNoteApp:
         self._eq_btns = {}
         for name in EQ_PRESETS:
             b = tk.Button(eq_row, text=name, width=7,
-                          font=(UI_FONT, 11, 'bold'),
+                          font=('Helvetica', 11, 'bold'),
                           relief='raised', bd=2,
                           highlightthickness=0, takefocus=0,
                           command=lambda k=name: self._eq_preset(k))
@@ -2074,16 +2024,12 @@ class NoteXNoteApp:
         honors a no rather than assuming the OS already did."""
         consent = self.prefs.get('music_scan_consent')
         if consent is None:
-            where = ("Mac (~/Music, ~/Downloads, and any mounted volumes)"
-                     if IS_MAC else
-                     "PC (your Music and Downloads folders, and other drives)")
-            prompt_os_note = (" — macOS may ask permission the first time"
-                               if IS_MAC else "")
             consent = messagebox.askyesno(
                 "Look for music folders?",
-                f"noteXnote can jump straight to folders it finds on your "
-                f"{where}{prompt_os_note}. Only folder names are read, "
-                f"nothing is sent anywhere. Look now?")
+                "noteXnote can jump straight to folders it finds on your "
+                "Mac (~/Music, ~/Downloads, and any mounted volumes) — "
+                "macOS may ask permission the first time. Only folder "
+                "names are read, nothing is sent anywhere. Look now?")
             self.prefs['music_scan_consent'] = consent
             self._save_prefs()
         menu = tk.Menu(self.root, tearoff=0)
@@ -2135,7 +2081,7 @@ class NoteXNoteApp:
         ytdlp = _find_tool('yt-dlp')
         if not ytdlp:
             messagebox.showerror("Missing yt-dlp",
-                                 f"Install with: {_install_hint('yt-dlp')}")
+                                 "Install with: brew install yt-dlp")
             return
         self._show_busy(busy_text)
         def work():
@@ -2310,7 +2256,7 @@ class NoteXNoteApp:
                 "Missing spotdl",
                 "spotdl is required for Spotify downloads.\n\n"
                 "Install with:\n  pip install spotdl\n\n"
-                f"Requires ffmpeg ({_install_hint('ffmpeg')}).")
+                "Requires ffmpeg (brew install ffmpeg).")
             return
         self._show_busy("Downloading from Spotify...")
         def work():
@@ -2398,7 +2344,7 @@ class NoteXNoteApp:
         self._hide_busy()
         self.status.set(f"Error: {msg}")
         messagebox.showerror("Load Error",
-                             f"{msg}\n\nMake sure ffmpeg is installed:\n  {_install_hint('ffmpeg')}")
+                             f"{msg}\n\nMake sure ffmpeg is installed:\n  brew install ffmpeg")
 
     def _eject_source(self):
         """Unload the current song entirely — wired to the eject button
@@ -2745,42 +2691,21 @@ class NoteXNoteApp:
 
     def _open_help(self):
         path = _resource_path('HELP.html')
-        if not os.path.isfile(path):
-            messagebox.showerror("Help", "HELP.html not found.")
-            return
-        if IS_WIN:
-            os.startfile(path)
-        else:
+        if os.path.isfile(path):
             subprocess.run(['open', path], check=False)
+        else:
+            messagebox.showerror("Help", "HELP.html not found.")
 
     def _uninstall(self):
-        data_dir = _data_dir()
         app_path = f'/Applications/{APP_NAME}.app'
-        if IS_MAC:
-            msg = (
-                f"This will permanently remove {APP_NAME} from your Mac:\n\n"
-                f"  • {app_path}\n"
-                f"  • {data_dir}\n"
-                "    (preferences, saved loops, EQ settings, plugins, audio cache)\n\n"
-                "This cannot be undone. Continue?"
-            )
-        else:
-            # No macOS-style single "the app lives here" convention on
-            # Windows, and self-deleting a running .exe out from under
-            # itself is a much less standard move there than removing a
-            # .app bundle from a detached shell — safer to just tell the
-            # operator where it is and let them remove that folder
-            # themselves, same as any other portable Windows program.
-            exe_dir = os.path.dirname(os.path.abspath(sys.executable))
-            msg = (
-                f"This will permanently remove {APP_NAME}'s saved data:\n\n"
-                f"  • {data_dir}\n"
-                "    (preferences, saved loops, EQ settings, plugins, audio cache)\n\n"
-                f"{APP_NAME} itself isn't removed automatically on Windows — "
-                f"delete this folder afterward to finish:\n"
-                f"  {exe_dir}\n\n"
-                "This cannot be undone. Continue?"
-            )
+        data_dir = _data_dir()
+        msg = (
+            f"This will permanently remove {APP_NAME} from your Mac:\n\n"
+            f"  • {app_path}\n"
+            f"  • {data_dir}\n"
+            "    (preferences, saved loops, EQ settings, plugins, audio cache)\n\n"
+            "This cannot be undone. Continue?"
+        )
         if not messagebox.askyesno(f"Uninstall {APP_NAME}", msg, icon='warning'):
             return
         try:
@@ -2788,23 +2713,19 @@ class NoteXNoteApp:
                 shutil.rmtree(data_dir, ignore_errors=True)
         except Exception:
             pass
-        if IS_MAC:
-            # Remove the .app bundle from a detached shell after this
-            # process exits, since we're currently running from inside it.
-            try:
-                subprocess.Popen(
-                    ['/bin/sh', '-c', f'sleep 1; rm -rf "{app_path}"'])
-            except Exception:
-                pass
+        # Remove the .app bundle from a detached shell after this process
+        # exits, since we're currently running from inside it.
+        try:
+            subprocess.Popen(
+                ['/bin/sh', '-c', f'sleep 1; rm -rf "{app_path}"'])
+        except Exception:
+            pass
         self.root.destroy()
         sys.exit(0)
 
     def _open_plugins_folder(self):
         try:
-            if IS_WIN:
-                os.startfile(_plugins_dir())
-            else:
-                subprocess.run(['open', _plugins_dir()], check=False)
+            subprocess.run(['open', _plugins_dir()], check=False)
         except Exception:
             pass
 
@@ -2815,7 +2736,7 @@ class NoteXNoteApp:
         win.minsize(420, 260)
         win.transient(self.root)
 
-        ttk.Label(win, text="Installed Plugins", font=(UI_FONT, 14, 'bold'),
+        ttk.Label(win, text="Installed Plugins", font=('Helvetica', 14, 'bold'),
                   padding=(14, 12, 14, 4)).pack(anchor='w')
 
         plugins = _scan_plugin_metadata()
@@ -2841,8 +2762,8 @@ class NoteXNoteApp:
                 top = ttk.Frame(row)
                 top.pack(fill='x')
                 ttk.Label(top, text=meta['name'],
-                          font=(UI_FONT, 12, 'bold')).pack(side='left')
-                toggle_btn = tk.Label(top, width=3, font=(UI_FONT, 12, 'bold'),
+                          font=('Helvetica', 12, 'bold')).pack(side='left')
+                toggle_btn = tk.Label(top, width=3, font=('Helvetica', 12, 'bold'),
                                        relief='flat', cursor='pointinghand')
                 toggle_btn.pack(side='right')
                 ttk.Label(row, text=meta['description'], foreground='#888',
@@ -3174,7 +3095,7 @@ def main():
     if not _find_tool('ffmpeg'):
         root.withdraw()
         messagebox.showerror("Missing ffmpeg",
-                             f"Install with: {_install_hint('ffmpeg')}")
+                             "Install with: brew install ffmpeg")
         return
     NoteXNoteApp(root)
     root.mainloop()
